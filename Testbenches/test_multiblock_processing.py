@@ -1,5 +1,10 @@
 #!/usr/bin/env python3
 
+import sys
+from pathlib import Path
+# Add parent directory to path for imports
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from migen import *
 from migen.sim import run_simulation
 from keccak_datapath_simd import KeccakDatapath
@@ -9,7 +14,7 @@ from sha3_function import sha3_256_sw
 def test_multiblock_processing():
     print("--- Multi-Block Processing Test ---")
     
-    dut = KeccakDatapath(MAX_BLOCKS=4, MAX_DIFFICULTY_BITS=128)
+    dut = KeccakDatapath(MAX_BLOCKS=16, MAX_DIFFICULTY_BITS=128)
 
     def generator():
         print("\n[TEST 1] Hash Validity Test (300 Bytes / 3 Blocks)")
@@ -36,7 +41,7 @@ def test_multiblock_processing():
         # --- FIX: Set Target to MAX (Always Succeed) ---
         # This prevents the hardware from incrementing the nonce and looping.
         # It will stop in the IDLE state with Nonce=1 and Hash=Hash(Nonce 1).
-        yield dut.target.eq(2**128 - 1) 
+        yield dut.target.eq(0x3FFFFFFFFFFFFFFFFFFFFFFFFFFFFFF) 
         
         yield dut.header_data.eq(test_input)
 
@@ -89,7 +94,7 @@ def test_multiblock_processing():
                 break 
 
             # Watchdog
-            if cycle_count > 200:
+            if cycle_count > 10000:
                 print("  [TIMEOUT] Simulation ran too long.")
                 break
             

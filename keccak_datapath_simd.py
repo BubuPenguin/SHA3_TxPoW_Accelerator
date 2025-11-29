@@ -162,8 +162,8 @@ class KeccakDatapath(LiteXModule):
             
             # Calculate the Global Index of this word
             # (Current Block * 17) + i
-            # Optimization: 17 = 16 + 1 = (block << 4) + block
-            global_word_idx = (self.block_counter << 4) + self.block_counter + i
+            # FIX: Use multiplication instead of shift to avoid Migen arithmetic shift bug
+            global_word_idx = (self.block_counter * 17) + i
             
             raw_word = current_raw_block[i*64 : (i+1)*64]
             word_out = Signal(64)
@@ -209,14 +209,34 @@ class KeccakDatapath(LiteXModule):
         self.comb += padded_slice_extended.eq(Cat(current_block_padded, Constant(0, 512)))
         
         # Nonce Masks (Only applied to Block 0)
+        # FIX: Use Cat() instead of shift to avoid Migen shift translation bug
+        # The nonce is inserted at bit position NONCE_START_BIT (32)
         nonce_mask_0 = Signal(1600)
         nonce_mask_1 = Signal(1600)
         width_mask = Constant((1 << self.NONCE_WIDTH_BITS) - 1, self.NONCE_WIDTH_BITS)
+        
+        # Masked nonce values
+        masked_nonce_0 = Signal(self.NONCE_WIDTH_BITS)
+        masked_nonce_1 = Signal(self.NONCE_WIDTH_BITS)
+        self.comb += [
+            masked_nonce_0.eq(self.nonce_0 & width_mask),
+            masked_nonce_1.eq(self.nonce_1 & width_mask)
+        ]
 
         self.comb += [
             If(self.block_counter == 0,
-                nonce_mask_0.eq((self.nonce_0 & width_mask) << self.NONCE_START_BIT),
-                nonce_mask_1.eq((self.nonce_1 & width_mask) << self.NONCE_START_BIT)
+                # Use Cat() to build the mask: [padding_low, nonce, padding_high]
+                # nonce_mask = {padding_high, nonce, padding_low}
+                nonce_mask_0.eq(Cat(
+                    Constant(0, self.NONCE_START_BIT),           # Bits 0-31: zeros
+                    masked_nonce_0,                               # Bits 32-271: nonce (240 bits)
+                    Constant(0, 1600 - self.NONCE_START_BIT - self.NONCE_WIDTH_BITS)  # Bits 272-1599: zeros
+                )),
+                nonce_mask_1.eq(Cat(
+                    Constant(0, self.NONCE_START_BIT),           # Bits 0-31: zeros
+                    masked_nonce_1,                               # Bits 32-271: nonce (240 bits)
+                    Constant(0, 1600 - self.NONCE_START_BIT - self.NONCE_WIDTH_BITS)  # Bits 272-1599: zeros
+                ))
             ).Else(
                 nonce_mask_0.eq(0),
                 nonce_mask_1.eq(0)
