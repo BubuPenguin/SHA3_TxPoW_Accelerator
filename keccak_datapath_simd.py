@@ -3,6 +3,8 @@ from litex.gen import *
 
 from utils import KECCAK_ROUND_CONSTANTS
 from keccak_core import KeccakCore
+from CountLeadingZero.clz_module import CountLeadingZeros
+from FixedIterationStop.fixed_iteration import FixedIterationStop
 
 class KeccakDatapath(LiteXModule):
     """
@@ -14,15 +16,15 @@ class KeccakDatapath(LiteXModule):
       it selects the raw block first, then applies padding logic only 
       to the active 1088-bit slice.
     """
-    def __init__(self, MAX_BLOCKS=16, MAX_DIFFICULTY_BITS=128, NONCE_DATA_FIELD_OVERWRITE_LOCATION=4, NONCE_DATA_FIELD_OVERWRITE_SIZE=30, NONCE_FIELD_BYTE_SIZE=34): 
+    def __init__(self, MAX_BLOCKS=16, MAX_DIFFICULTY_BITS=256, NONCE_DATA_FIELD_OVERWRITE_SPACING=2, NONCE_DATA_FIELD_OVERWRITE_SIZE=30, NONCE_FIELD_BYTE_SIZE=34, NONCE_DATA_FIELD_BYTE_SIZE=32, target_iterations=5000000): 
         # --- Constants ---
-        self.NONCE_DATA_FIELD_OVERWRITE_LOCATION = NONCE_DATA_FIELD_OVERWRITE_LOCATION 
+        self.NONCE_DATA_FIELD_OVERWRITE_SPACING = NONCE_DATA_FIELD_OVERWRITE_SPACING 
         self.NONCE_DATA_FIELD_OVERWRITE_SIZE = NONCE_DATA_FIELD_OVERWRITE_SIZE
+        self.NONCE_DATA_FIELD_BYTE_SIZE = NONCE_DATA_FIELD_BYTE_SIZE
         self.NONCE_FIELD_BYTE_SIZE = NONCE_FIELD_BYTE_SIZE
-
-        self.NONCE_START_BIT = self.NONCE_DATA_FIELD_OVERWRITE_LOCATION * 8
+        self.NONCE_START_BIT = (self.NONCE_FIELD_BYTE_SIZE - self.NONCE_DATA_FIELD_OVERWRITE_SIZE) * 8
         self.NONCE_WIDTH_BITS = self.NONCE_DATA_FIELD_OVERWRITE_SIZE * 8
-        self.nonce_field_bits = self.NONCE_FIELD_BYTE_SIZE * 8
+        self.nonce_field_bits = self.NONCE_DATA_FIELD_BYTE_SIZE * 8
 
         # --- Standard SHA3-256 parameters ---
         self.RATE_WORDS = 17
@@ -38,22 +40,28 @@ class KeccakDatapath(LiteXModule):
         self.start = Signal()
         self.stop = Signal()
         self.running = Signal()
-        self.found = Signal(2) 
+        self.found = Signal(2)
+        self.idle = Signal() 
         
-        self.timeout_limit = Signal(32)
+        self.timeout_limit = Signal(32, reset=0xFFFFFFFF)
         self.timeout = Signal()
         
         # --- Data Inputs ---
         self.header_data = Signal(self.BLOCK_BITS * MAX_BLOCKS) 
         self.input_length = Signal(32)  
-        self.target = Signal(MAX_DIFFICULTY_BITS)
+        self.target_clz = Signal(9, reset=0) # Required minimum CLZ (0 to 256) - number of leading zeros
         
         # --- Results ---
-        self.nonce_result = Signal(self.nonce_field_bits)
+        # Nonce result is 32 bytes (256 bits) = 30-byte nonce + 2-byte header prefix
+        self.nonce_result = Signal(self.NONCE_DATA_FIELD_BYTE_SIZE * 8)
+        
+        # Debug: Expose the first 64 bytes of block 0 with nonce injected (for verification)
+        self.debug_block0_data = Signal(512)  # 64 bytes = 512 bits
         
         # --- Internals ---
         self.round_index = Signal(5)
         self.timeout_counter = Signal(32)
+        self.iteration_counter = Signal(64)  # 64-bit counter for hash iterations
         
         self.block_counter = Signal(max=MAX_BLOCKS)
         self.total_blocks = Signal(max=MAX_BLOCKS)
@@ -72,7 +80,6 @@ class KeccakDatapath(LiteXModule):
             Cat(*self.core_0.step_input).eq(self.state_0),
             Cat(*self.core_1.step_input).eq(self.state_1),
         ]
-
         # =========================================================================
         # 1. DYNAMIC BLOCK CALCULATOR
         # =========================================================================
@@ -104,7 +111,6 @@ class KeccakDatapath(LiteXModule):
             block_cases[b] = current_raw_block.eq(self.header_data[b*self.BLOCK_BITS : (b+1)*self.BLOCK_BITS])
         
         self.comb += Case(self.block_counter, block_cases)
-
         # =========================================================================
         # 3. LUT PADDING LOGIC (Stage 2)
         # =========================================================================
@@ -201,7 +207,6 @@ class KeccakDatapath(LiteXModule):
         # =========================================================================
         # 4. FSM
         # =========================================================================
-
         self.submodules.fsm = FSM(reset_state="IDLE")
         
         # Extend the 1088-bit Rate slice to full 1600-bit State
@@ -243,29 +248,76 @@ class KeccakDatapath(LiteXModule):
             )
         ]
         
-        # Extract bottom MAX_DIFFICULTY_BITS from 1600-bit state for difficulty comparison
-        # SHA3-256 uses the first 256 bits (LSBs) of the state as the hash output
-        # For 128-bit difficulty: state[0:128] extracts bits 0-127 (bottom 128 bits)
-        state_0_top_bits = Signal(MAX_DIFFICULTY_BITS)
-        state_1_top_bits = Signal(MAX_DIFFICULTY_BITS)
+        # =========================================================================
+        # 5. RESULT EXTRACTION & COMPARISON (CLZ VERSION)
+        # =========================================================================
         
-        # Calculate slice bounds (Python arithmetic, evaluated at construction time)
-        # Extract from bottom (LSBs) for SHA3-256 standard
-        slice_low = 0
-        slice_high = MAX_DIFFICULTY_BITS
+        # Extract the Raw Hash (Bottom 256 bits)
+        raw_hash_0 = self.state_0[0:MAX_DIFFICULTY_BITS]
+        raw_hash_1 = self.state_1[0:MAX_DIFFICULTY_BITS]
         
+        # Instantiate CLZ modules for both cores
+        self.submodules.clz_0 = CountLeadingZeros(width=MAX_DIFFICULTY_BITS)
+        self.submodules.clz_1 = CountLeadingZeros(width=MAX_DIFFICULTY_BITS)
+        
+        # Connect hash inputs to CLZ modules
         self.comb += [
-            state_0_top_bits.eq(self.state_0[slice_low:slice_high]),
-            state_1_top_bits.eq(self.state_1[slice_low:slice_high])
+            self.clz_0.i.eq(raw_hash_0),
+            self.clz_1.i.eq(raw_hash_1),
         ]
-
+        
+        # OPTIONAL: Keep FixedIterationStop for testing (commented out)
+        # To use fixed iteration mode instead of real difficulty:
+        # self.submodules.clz_0 = FixedIterationStop(target_iterations=target_iterations)
+        # self.submodules.clz_1 = FixedIterationStop(target_iterations=target_iterations)
+        # self.comb += [
+        #     self.clz_0.i.eq(raw_hash_0),
+        #     self.clz_0.iteration.eq(self.iteration_counter),
+        #     self.clz_1.i.eq(raw_hash_1),
+        #     self.clz_1.iteration.eq(self.iteration_counter),
+        # ]
+        
+        # Expose CLZ outputs for debug
+        self.clz_0_out = Signal(9)  # 9 bits for 0 to 256
+        self.clz_1_out = Signal(9)  # 9 bits for 0 to 256
+        self.comb += [
+            self.clz_0_out.eq(self.clz_0.o),
+            self.clz_1_out.eq(self.clz_1.o),
+        ]
+        
+        # Preserve signals for debugging
+        self.clz_0_out.attr.add(("keep", "true"))
+        self.clz_1_out.attr.add(("keep", "true"))
+        self.target_clz.attr.add(("keep", "true"))
+        
+        # For backward compatibility with debug_comparison register (now CLZ >= target_clz)
+        self.hash0_lt_target = Signal()
+        self.hash1_lt_target = Signal()
+        self.comb += [
+            self.hash0_lt_target.eq(self.clz_0_out >= self.target_clz),
+            self.hash1_lt_target.eq(self.clz_1_out >= self.target_clz)
+        ]
+        self.hash0_lt_target.attr.add(("keep", "true"))
+        self.hash1_lt_target.attr.add(("keep", "true"))
+        
+        # Increment timeout counter every cycle when running (not in IDLE or DONE states)
+        # This ensures timeout is measured in clock cycles, not iterations
+        self.sync += [
+            If(self.running,
+                self.timeout_counter.eq(self.timeout_counter + 1)
+            )
+        ]
+        
         self.fsm.act("IDLE",
             self.running.eq(0),
             self.found.eq(0),
+            self.idle.eq(1),
+            # Only start if the Start signal is asserted
             If(self.start,
                 NextValue(self.nonce_0, 1),
                 NextValue(self.nonce_1, 0),
                 NextValue(self.timeout_counter, 0),
+                NextValue(self.iteration_counter, 0),  # Reset iteration counter
                 self.timeout.eq(0),
                 NextState("INIT_HASH")
             )
@@ -273,6 +325,7 @@ class KeccakDatapath(LiteXModule):
         
         self.fsm.act("INIT_HASH",
             self.running.eq(1),
+            self.idle.eq(0),
             NextValue(self.state_0, 0),
             NextValue(self.state_1, 0),
             NextValue(self.block_counter, 0),
@@ -281,15 +334,21 @@ class KeccakDatapath(LiteXModule):
         
         self.fsm.act("ABSORB",
             self.running.eq(1),
+            self.idle.eq(0),
             # XOR Data into State
             NextValue(self.state_0, self.state_0 ^ padded_slice_extended ^ nonce_mask_0),
             NextValue(self.state_1, self.state_1 ^ padded_slice_extended ^ nonce_mask_1),
             NextValue(self.round_index, 0),
+            # Debug: Capture first 64 bytes of block 0 data with nonce for verification
+            If(self.block_counter == 0,
+                NextValue(self.debug_block0_data, (padded_slice_extended ^ nonce_mask_0)[0:512])
+            ),
             NextState("PERMUTE")
         )
         
         self.fsm.act("PERMUTE",
             self.running.eq(1),
+            self.idle.eq(0),
             NextValue(self.state_0, Cat(*self.core_0.iota_out)),
             NextValue(self.state_1, Cat(*self.core_1.iota_out)),
             
@@ -308,24 +367,53 @@ class KeccakDatapath(LiteXModule):
         
         self.fsm.act("CHECK_RESULT",
             self.running.eq(1),
-            NextValue(self.timeout_counter, self.timeout_counter + 1),
+            self.idle.eq(0),
             
-            If(state_0_top_bits < self.target,
-                NextValue(self.nonce_result, self.nonce_0),
-                self.found.eq(1),
-                NextState("IDLE")
-            ).Elif(state_1_top_bits < self.target,
-                NextValue(self.nonce_result, self.nonce_1),
-                self.found.eq(2),
-                NextState("IDLE")
-            ).Elif(self.stop,
-                NextState("IDLE")
-            ).Elif((self.timeout_limit != 0) & (self.timeout_counter >= self.timeout_limit),
+            # CHECK DIFFICULTY using the CLZ (Count Leading Zeros)
+            # If (CLZ of hash >= required CLZ) then we have a potential solution.
+            
+            # Check timeout FIRST (before checking results) to ensure cycle limit is enforced
+            If((self.timeout_limit != 0) & (self.timeout_counter >= self.timeout_limit),
                 self.timeout.eq(1),
+                NextState("DONE_TIMEOUT")
+            ).Elif(self.clz_0_out >= self.target_clz,
+                NextValue(self.nonce_result, Cat(self.header_data[16:32], self.nonce_0)),
+                NextState("DONE_FOUND_0") 
+            ).Elif(self.clz_1_out >= self.target_clz,
+                NextValue(self.nonce_result, Cat(self.header_data[16:32], self.nonce_1)),
+                NextState("DONE_FOUND_1")
+            ).Elif(self.stop,
                 NextState("IDLE")
             ).Else(
                 NextValue(self.nonce_0, self.nonce_0 + 1),
                 NextValue(self.nonce_1, self.state_1[0:self.NONCE_WIDTH_BITS]),
+                NextValue(self.iteration_counter, self.iteration_counter + 1),  # Increment iteration counter
                 NextState("INIT_HASH")
             )
+        )
+        
+        # --- NEW HANDSHAKE STATES ---
+        
+        # Hold FOUND=1 until software clears 'start'
+        self.fsm.act("DONE_FOUND_0",
+            self.running.eq(0),
+            self.found.eq(1),
+            self.idle.eq(0),
+            If(~self.start, NextState("IDLE"))
+        )
+        
+        # Hold FOUND=2 until software clears 'start'
+        self.fsm.act("DONE_FOUND_1",
+            self.running.eq(0),
+            self.found.eq(2),
+            self.idle.eq(0),
+            If(~self.start, NextState("IDLE"))
+        )
+        
+        # Hold TIMEOUT until software clears 'start'
+        self.fsm.act("DONE_TIMEOUT",
+            self.running.eq(0),
+            self.timeout.eq(1),
+            self.idle.eq(0),
+            If(~self.start, NextState("IDLE"))
         )

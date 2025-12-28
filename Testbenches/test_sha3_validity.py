@@ -9,7 +9,7 @@ from migen import *
 from migen.sim import run_simulation
 from keccak_datapath_simd import KeccakDatapath
 import hashlib
-from sha3_function import sha3_256_sw
+from VerificationTest.sha3_function import sha3_256_sw
 
 def test_sha3_validity():
     print("--- SHA3 Validity Test ---")
