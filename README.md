@@ -64,23 +64,32 @@ Located in `VerificationTest/`:
   - Can verify hardware-generated nonces by inserting them into test data
   - Provides platform-independent validation (Java vs Python vs Hardware)
   
-**Quick Start:**
-```bash
-cd VerificationTest/BouncyCastle
-./compile.sh                    # Compile Java test
-./verify_nonce.sh               # Run basic test
-./verify_nonce.sh <nonce_hex>   # Verify hardware nonce (30 bytes hex)
-```
+## Benchmarks
+
+### Accelerator Tests (`accelerator_hashtest/`)
+Performance benchmarks running directly on the hardware accelerator.
+- **`hashtest_attempts.c`**: Measures hashrate across varying attempt limits (10 to 100M).
+- **`hashtest_inputsize.c`**: Benchmarks hashrate versus input payload size (up to 4 blocks).
+- **`hashtest_pulse.c`**: Runs short 1-second pulses to measuring peak burst performance.
+
+### CPU Baseline (`cpu_hashtest/`)
+Software-only benchmarks for performance comparison.
+- **`sha3_bench_sw.c`**: Optimized C implementation measuring software Keccak hashrate on the CPU.
+- **`Sha3Bench.java`**: Java-based benchmark using BouncyCastle (simulates Minima node performance).
+
+## Integration
+
+### JNI Bridge (`jni/`) (Work In Progress)
+Native interface for integrating the accelerator with the Minima Java node.
+- **`sha3accelerator_jni.c`**: C-side JNI implementation (Currently Incomplete/Experimental).
+- **`JNI_INTEGRATION_GUIDE.md`**: Guide for building and linking the shared library.
+
 
 ## Requirements
 
 - Python 3.x
 - Migen (Python-based hardware description language)
 - LiteX (SoC builder framework)
-
-## Usage
-
-See individual testbench files for usage examples.
 
 ## Debug & Development Tools
 
@@ -97,8 +106,4 @@ See individual testbench files for usage examples.
   - `test_pure_dma.py`: Synchronous DMA reader test with fixed 1-to-1 data transfer
   - `test_dma_characteristic.py`: Minimal test exploring LiteX DMA timing characteristics
   - Early experiments for potential DMA-based data transfer (currently uses CSR interface)
-
-## License
-
-[Add your license here]
 
