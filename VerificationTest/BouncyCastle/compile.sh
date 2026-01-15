@@ -27,6 +27,7 @@ fi
 echo "Compilation successful!"
 echo ""
 echo "Run tests with:"
-echo "  ./verify_nonce.sh              # Run basic test (no nonce)"
-echo "  ./verify_nonce.sh <nonce_hex>  # Verify hardware nonce"
+echo "  ./verify_nonce.sh                      # Run basic test (100 bytes, no nonce)"
+echo "  ./verify_nonce.sh <input_size>         # Test with custom size"
+echo "  ./verify_nonce.sh <input_size> <nonce> # Verify hardware nonce"
 

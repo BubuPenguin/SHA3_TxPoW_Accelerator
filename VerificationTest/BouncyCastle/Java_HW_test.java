@@ -105,27 +105,48 @@ public class Java_HW_test {
         System.out.println("SHA3-256 Hash Comparison Test");
         System.out.println("========================================");
         
-        // Test Data - Same pattern as C hardware test (100 bytes)
-        // Pattern: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88] repeated
-        // Bytes 0-1: nonce structure (scale=1, length=32)
-        // Bytes 2-33: nonce field (zeros)
-        // Bytes 34-99: repeating pattern
-        byte[] baseHeader = generateTestHeader(100);
-        
-        // Check if nonce provided via command line
+        // Default values
+        int inputSize = 100;  // Default 100 bytes (matches C test default)
         byte[] nonceToInsert = null;
-        if (args.length > 0) {
-            System.out.println("Nonce provided via command line");
+        
+        // Parse command line arguments
+        // Usage: java Java_HW_test [input_size] [nonce_hex]
+        if (args.length >= 1) {
             try {
-                nonceToInsert = parseNonceHex(args[0]);
-                System.out.println("Parsed nonce: " + nonceToInsert.length + " bytes");
-            } catch (Exception e) {
-                System.err.println("ERROR: Failed to parse nonce hex string");
-                System.err.println("Usage: java Java_HW_test [nonce_hex]");
-                System.err.println("Example: java Java_HW_test 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e");
+                inputSize = Integer.parseInt(args[0]);
+                if (inputSize < 1 || inputSize > 2176) {
+                    System.err.println("ERROR: input_size must be between 1 and 2176 bytes");
+                    System.err.println("Usage: java Java_HW_test [input_size] [nonce_hex]");
+                    return;
+                }
+                System.out.println("Input size: " + inputSize + " bytes");
+            } catch (NumberFormatException e) {
+                System.err.println("ERROR: Invalid input_size format");
+                System.err.println("Usage: java Java_HW_test [input_size] [nonce_hex]");
+                System.err.println("Example: java Java_HW_test 200 0000005EC244FCABD705DDEBC5F640477D87061E1968787A96E797161CB3C917");
                 return;
             }
         }
+        
+        if (args.length >= 2) {
+            System.out.println("Nonce provided via command line");
+            try {
+                nonceToInsert = parseNonceHex(args[1]);
+                System.out.println("Parsed nonce: " + nonceToInsert.length + " bytes");
+            } catch (Exception e) {
+                System.err.println("ERROR: Failed to parse nonce hex string");
+                System.err.println("Usage: java Java_HW_test [input_size] [nonce_hex]");
+                System.err.println("Example: java Java_HW_test 200 0000005EC244FCABD705DDEBC5F640477D87061E1968787A96E797161CB3C917");
+                return;
+            }
+        }
+        
+        // Generate test header with specified size
+        // Pattern: [0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88] repeated
+        // Bytes 0-1: nonce structure (scale=1, length=32)
+        // Bytes 2-33: nonce field (zeros initially)
+        // Bytes 34+: repeating pattern
+        byte[] baseHeader = generateTestHeader(inputSize);
         
         // Apply nonce if provided
         byte[] dataToHash;
@@ -173,13 +194,19 @@ public class Java_HW_test {
         // 4. USAGE EXAMPLES
         if (args.length == 0) {
             System.out.println();
+            System.out.println("Usage: java Java_HW_test [input_size] [nonce_hex]");
+            System.out.println("  input_size: Input data size in bytes (1-2176, default: 100)");
+            System.out.println("  nonce_hex:  30-byte nonce in hex format (optional)");
+            System.out.println();
             System.out.println("To verify a hardware result:");
             System.out.println("  1. Read nonce_result from hardware (32 bytes)");
             System.out.println("  2. Extract the 30-byte nonce (bytes 2-31 of register)");
-            System.out.println("  3. Run: java Java_HW_test <nonce_hex>");
+            System.out.println("  3. Run: java Java_HW_test <input_size> <nonce_hex>");
             System.out.println();
-            System.out.println("Example with sample nonce:");
-            System.out.println("  java Java_HW_test 0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e");
+            System.out.println("Examples:");
+            System.out.println("  java Java_HW_test");
+            System.out.println("  java Java_HW_test 200");
+            System.out.println("  java Java_HW_test 200 0000005EC244FCABD705DDEBC5F640477D87061E1968787A96E797161CB3C917");
         }
     }
 

@@ -23,8 +23,13 @@ riscv64-linux-gnu-gcc -o test_clz_accelerator test_clz_accelerator.c -static
 ## Usage
 
 ```bash
-./test_clz_accelerator [target_clz] [timeout_cycles]
+./test_clz_accelerator [target_clz] [timeout_cycles] [input_size]
 ```
+
+**Parameters:**
+- `target_clz`: Number of leading zeros required (default: 8)
+- `timeout_cycles`: Hardware clock cycle timeout, 0 = disabled (default: 0)
+- `input_size`: Input data size in bytes, 1-2176 (default: 100)
 
 ### Parameters
 
@@ -52,6 +57,18 @@ riscv64-linux-gnu-gcc -o test_clz_accelerator test_clz_accelerator.c -static
 
 # Hard difficulty with timeout protection
 ./test_clz_accelerator 20 10000000
+
+# Test with 1 block (136 bytes)
+./test_clz_accelerator 8 0 136
+
+# Test with 2 blocks (272 bytes)
+./test_clz_accelerator 8 0 272
+
+# Test with 4 blocks (544 bytes) - multi-block processing
+./test_clz_accelerator 12 0 544
+
+# Maximum size: 16 blocks (2176 bytes)
+./test_clz_accelerator 8 0 2176
 ```
 
 ## What the Test Does
@@ -128,45 +145,4 @@ riscv64-linux-gnu-gcc -o test_clz_accelerator test_clz_accelerator.c -static
    ssh root@<fpga_ip>
    ./test_clz_accelerator 8
    ```
-
-## Troubleshooting
-
-### "HW Init failed"
-- Check that `/dev/mem` is accessible (may need root)
-- Verify TXPOW_BASE address matches your hardware
-
-### Test Times Out
-- Lower the difficulty (target_clz)
-- Increase or disable timeout
-- Check that accelerator clock is running
-
-### Hash Doesn't Meet Difficulty
-- Check debug CLZ registers vs target
-- Verify CLZ module is correctly synthesized
-- Check for timing violations in synthesis
-
-### Nonce Mismatch
-- Debug register read timing
-- Check CSR address offsets match gateware
-- Verify LiteX CSR endianness handling
-
-## Comparison with FixedIterationStop Test
-
-The CLZ-based test differs from the fixed iteration test:
-
-| Feature | FixedIterationStop | CLZ-Based |
-|---------|-------------------|-----------|
-| Stop Condition | Fixed iteration count | Hash meets difficulty |
-| Difficulty | None (always succeeds) | Configurable (CLZ) |
-| Timeout | Optional | Optional |
-| Verification | Iteration count only | Hash difficulty + CLZ |
-| Real PoW | No | Yes |
-
-## Next Steps
-
-- **Performance Tuning**: Measure hash rate at different clock frequencies
-- **Difficulty Scaling**: Test with progressively higher CLZ values
-- **DMA Testing**: Add test for DMA-based header loading
-- **Multi-Block**: Test with headers > 136 bytes
-- **Endianness Validation**: Verify against reference SHA3 implementation
 

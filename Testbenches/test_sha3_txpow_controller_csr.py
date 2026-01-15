@@ -1,16 +1,25 @@
 #!/usr/bin/env python3
 
 """
-SHA3 TxPoW Controller CSR Test (HUMAN READABLE & ENHANCED)
+SHA3 TxPoW Controller CSR Test (Updated for CLZ)
 
 Description:
     This test loads data into the controller using CSR registers and verifies
-    the mining functionality.
+    the mining functionality. This test accesses the hardware through the
+    SHA3TxPoWController wrapper (CSR interface), unlike test_multiblock_processing.py
+    which accesses the KeccakDatapath core directly.
 
-Updates:
-    - Added Color Output.
-    - Standardized verification logic.
-    - Improved comments.
+Architecture:
+    - Uses SHA3TxPoWController (wrapper with CSR registers)
+    - Accesses hardware via CSR registers: _nonce_result, _debug_hash0/1, _debug_clz0/1
+    - Uses CSR control/status registers: _control, _status, _input_len, _target_clz
+    - Writes data via CSR windowed interface: _header_addr, _header_data_low/high, _header_we
+
+Usage:
+    python3 test_sha3_txpow_controller_csr.py [input_size] [target_clz]
+    
+    input_size: Input data size in bytes (default: 100, max: 2176)
+    target_clz: Target leading zeros (default: 0 = accept any hash)
 """
 
 import sys
@@ -29,24 +38,6 @@ from sha3_txpow_controller import (
     MNONCE_DATA_FIELD_BYTE_SIZE
 )
 
-# ==============================================================================
-# Configuration & Constants
-# ==============================================================================
-
-# Target CLZ (number of leading zeros required)
-# For example: CLZ=2 means hash must have at least 2 leading zeros
-TARGET_CLZ = 2
-TIMEOUT_CYCLES = 5000
-
-class Colors:
-    HEADER = '\033[95m'
-    BLUE = '\033[94m'
-    CYAN = '\033[96m'
-    GREEN = '\033[92m'
-    WARNING = '\033[93m'
-    FAIL = '\033[91m'
-    ENDC = '\033[0m'
-    BOLD = '\033[1m'
 
 # ==============================================================================
 # Helper Functions
@@ -108,19 +99,22 @@ def write_header_via_csr(dut, header_bytes):
         yield dut._header_we.storage.eq(0)
         yield
 
-def verify_hardware_state(dut, original_test_bytes):
+def verify_hardware_state(dut, original_test_bytes, target_clz):
     """
     Reads HW state, calculates expected Python hash, and prints a comparison report.
     """
     # 1. Read Nonce
     nonce_full = yield dut._nonce_result.status
-    # Extract nonce bytes (32 bytes total: 30 bytes nonce data + 2 bytes header prefix at LSB)
+    # Extract nonce bytes (32 bytes total: bytes 0-1 are spacing, bytes 2-31 are 30-byte nonce)
     nonce_bytes_full = nonce_full.to_bytes(MNONCE_DATA_FIELD_BYTE_SIZE, 'little')
+    
+    # Extract 30-byte nonce from bytes 2-31 of the register
+    nonce_30_bytes = nonce_bytes_full[2:32]
     
     # 2. Reconstruct Data
     expected_data = bytearray(original_test_bytes)
-    # Overwrite starting from byte 2 with the entire 32-byte nonce_result
-    expected_data[2:2 + MNONCE_DATA_FIELD_BYTE_SIZE] = nonce_bytes_full
+    # Overwrite bytes 4-33 with the 30-byte nonce (matching hardware behavior)
+    expected_data[4:34] = nonce_30_bytes
     
     # 3. Calculate Python Hash
     h = hashlib.sha3_256(expected_data)
@@ -132,129 +126,224 @@ def verify_hardware_state(dut, original_test_bytes):
     found_src = yield dut.miner.found
     if found_src == 2: 
         hw_hash_le = yield dut._debug_hash1.status
+        winning_clz = yield dut._debug_clz1.status
     else: 
         hw_hash_le = yield dut._debug_hash0.status
+        winning_clz = yield dut._debug_clz0.status
     
-    # 5. Format for Display
+    # 5. Read CLZ values for both cores
+    clz_0 = yield dut._debug_clz0.status
+    clz_1 = yield dut._debug_clz1.status
+    
+    # 6. Format for Display
     hw_hash_be = int.from_bytes(hw_hash_le.to_bytes(32, 'little'), 'big')
-    nonce_be = int.from_bytes(nonce_bytes_full, 'big')
+    nonce_hex_le = ''.join(f'{b:02X}' for b in nonce_30_bytes)
     
-    # 6. Print Report
-    print("-" * 80)
-    print(f"{Colors.BOLD}VERIFICATION REPORT{Colors.ENDC}")
-    print("-" * 80)
-    print(f"Target CLZ:      {TARGET_CLZ} (leading zeros required)")
-    print(f"Nonce Found (BE): 0x{nonce_be:064x}")
-    print(f"Hash Value (BE):  0x{hw_hash_be:064x}")
-    print("-" * 80)
-    print(f"Expected (Py BE): 0x{h_int_be:064x}")
-    print(f"Hardware (BE):    0x{hw_hash_be:064x}")
-    print("-" * 80)
+    # 7. Print Report
+    print(f"\n    Nonce (LE):    0x{nonce_hex_le}")
+    print(f"    Expected (BE): 0x{h_int_be:064X}")
+    print(f"    Actual   (HW): 0x{hw_hash_be:064X}")
+    print(f"    Core 0 CLZ: {clz_0}")
+    print(f"    Core 1 CLZ: {clz_1}")
+    print(f"    Winner CLZ: {winning_clz}")
     
+    # 8. Verify
     hash_match = (h_int_le == hw_hash_le)
-    # Note: Difficulty check is now done via CLZ in hardware, not via comparison here
-    diff_pass = True  # CLZ-based difficulty check is handled in hardware
+    clz_sufficient = (winning_clz >= target_clz)
     
-    if hash_match:
-        print(f"{Colors.GREEN}[PASS] ✓ Hash Verified{Colors.ENDC}")
-    else:
-        print(f"{Colors.FAIL}[FAIL] ✗ Hash Mismatch{Colors.ENDC}")
+    if hash_match and clz_sufficient:
+        print(f"    [PASS] ✓ Hash matches and CLZ >= {target_clz}!")
+    elif not hash_match:
+        print(f"    [FAIL] ✗ Hash mismatch!")
+        diff_bits = hw_hash_be ^ h_int_be
+        print(f"    XOR (difference): 0x{diff_bits:064X}")
+    elif not clz_sufficient:
+        print(f"    [FAIL] ✗ CLZ={winning_clz} < target={target_clz}!")
         
-    return hash_match and diff_pass
+    return hash_match and clz_sufficient
 
 # ==============================================================================
 # Main Test
 # ==============================================================================
 
-def test_csr_mode():
-    print("="*80)
-    print(f"{Colors.HEADER}SHA3 TxPoW Controller - CSR Mode Test{Colors.ENDC}")
-    print("="*80)
+def test_csr_mode(input_size=100, target_clz=0):
+    print("="*70)
+    print("SHA3 TxPoW Controller CSR Test Suite")
+    print("="*70)
+    print(f"Input Size:  {input_size} bytes")
+    print(f"Target CLZ:  {target_clz} leading zeros")
     
     dut = SHA3TxPoWController()
+    
+    # Calculate expected blocks
+    EXPECTED_BLOCKS = (input_size // 136) + 1
+    timeout_cycles = 200000 if target_clz > 0 else 100000
 
-    def run_test_case(test_name, input_bytes):
-        print(f"\n{Colors.CYAN}=== {test_name} ({len(input_bytes)} Bytes) ==={Colors.ENDC}")
+    def generator():
+        # ======================================================================
+        # Hash Validity Test
+        # ======================================================================
+        print("\n" + "="*70)
+        print(f"[TEST] Hash Validity Test ({input_size} Bytes)")
+        print("="*70)
+        
+        # 1. Setup Input Data
+        test_input_bytes = generate_byte_array(input_size)
+        
+        print(f"  Input Size: {len(test_input_bytes)} bytes")
+        print(f"  Expected Blocks: {EXPECTED_BLOCKS}")
+        print(f"  Target CLZ: {target_clz}")
 
-        # 1. Write header data via CSR
-        print(f"  {Colors.CYAN}[CSR Write]{Colors.ENDC} Writing {len(input_bytes)} bytes...")
-        yield from write_header_via_csr(dut, input_bytes)
+        # 2. Write header data via CSR
+        yield from write_header_via_csr(dut, test_input_bytes)
         
         # Wait for internal writes to settle
         for _ in range(10): yield
         
-        # Read and display header memory contents
-        header_data_full = yield dut.miner.header_data
-        header_bytes = bytearray()
-        for i in range(len(input_bytes)):
-            byte_val = (header_data_full >> (i * 8)) & 0xFF
-            header_bytes.append(byte_val)
-        
-        print(f"  {Colors.CYAN}[Header Memory]{Colors.ENDC} First 16 bytes: {header_bytes[:16].hex()}")
-        print(f"  {Colors.CYAN}[Header Memory]{Colors.ENDC} Expected first 16: {bytes(input_bytes[:16]).hex()}")
-        if header_bytes[:len(input_bytes)] == bytes(input_bytes):
-            print(f"  {Colors.GREEN}[Header Memory] ✓ Data matches expected input{Colors.ENDC}")
-        else:
-            print(f"  {Colors.FAIL}[Header Memory] ✗ Data mismatch!{Colors.ENDC}")
-
-        # 2. Configure DUT
-        yield dut._input_len.storage.eq(len(input_bytes))
-        yield dut._target_clz.storage.eq(TARGET_CLZ)
-        yield dut._timeout.storage.eq(TIMEOUT_CYCLES)
+        # 3. Configure DUT
+        yield dut._input_len.storage.eq(len(test_input_bytes))
+        yield dut._target_clz.storage.eq(target_clz)
+        yield dut._timeout.storage.eq(timeout_cycles)
         yield
         
-        # 3. Wait for Idle
-        print(f"  [{test_name}] Waiting for IDLE...")
+        # 4. Wait for Idle
         while True:
             status = yield dut._status.status
-            if status & 1: break
+            if status & 1: break  # Idle bit
             yield
         
-        # 4. Start Miner
+        # 5. Start Miner
         yield dut._control.storage.eq(1)
         yield
+        yield dut._control.storage.eq(0)
+        yield
         
-        # 5. Poll for Completion
-        success = False
-        for i in range(TIMEOUT_CYCLES):
+        # 6. Poll for Completion
+        cycle_count = 0
+        verified = False
+        last_debug_block_data = None
+        block_iteration = 0
+        debug_read_interval = 25  # Read every ~25 cycles (covers ABSORB + some PERMUTE cycles)
+        
+        print(f"\n  [DEBUG] Monitoring block data for each iteration...")
+        print(f"  Expected blocks: {EXPECTED_BLOCKS}")
+        
+        while True:
             status = yield dut._status.status
             found = (status >> 2) & 1
             timeout = (status >> 3) & 1
+            running = (status >> 1) & 1
+            
+            cycle_count += 1
+            
+            # Read debug_block0_data periodically while running to capture each block
+            if running and cycle_count % debug_read_interval == 0:
+                debug_block_data = yield dut._debug_block0_data.status
+                
+                # Check if this is a new block (data changed)
+                if debug_block_data != last_debug_block_data:
+                    block_iteration += 1
+                    last_debug_block_data = debug_block_data
+                    
+                    # Convert to bytes for display
+                    block_bytes = debug_block_data.to_bytes(64, 'little')
+                    
+                    # Determine if this is Block 0 (has nonce) or subsequent block
+                    # Block 0 will have non-zero bytes in the nonce area (bytes 4-33)
+                    # Note: This is a heuristic - Block 0 has nonce injected, others don't
+                    is_block_0 = (block_iteration == 1) or any(block_bytes[4:34])
+                    block_num = block_iteration - 1
+                    
+                    print(f"\n  [Block {block_num} @ Cycle {cycle_count}] First 64 bytes:")
+                    print(f"    Bytes 0-15:   {' '.join(f'{b:02X}' for b in block_bytes[0:16])}")
+                    print(f"    Bytes 16-31:  {' '.join(f'{b:02X}' for b in block_bytes[16:32])}")
+                    print(f"    Bytes 32-47:  {' '.join(f'{b:02X}' for b in block_bytes[32:48])}")
+                    print(f"    Bytes 48-63:  {' '.join(f'{b:02X}' for b in block_bytes[48:64])}")
+                    
+                    if block_num == 0:
+                        print(f"    [Block 0] Nonce area (bytes 4-33) contains nonce data")
+                        print(f"    Nonce bytes (4-33): {' '.join(f'{b:02X}' for b in block_bytes[4:34])}")
+                    else:
+                        print(f"    [Block {block_num}] Raw block data (no nonce injection)")
+                    
+                    # Stop reading after all expected blocks
+                    if block_iteration >= EXPECTED_BLOCKS:
+                        debug_read_interval = 10000  # Reduce frequency after initial blocks
             
             if timeout:
-                print(f"  {Colors.FAIL}[TIMEOUT] Cycle {i}{Colors.ENDC}")
+                print(f"\n  [TIMEOUT] Simulation ran too long ({cycle_count} cycles).")
+                print(f"  Note: Target CLZ={target_clz} may be too high for quick simulation.")
                 yield dut._control.storage.eq(0)
                 yield; yield
                 break
             
             elif found:
-                print(f"  {Colors.GREEN}[FOUND] Solution at Cycle {i}{Colors.ENDC}")
-                yield # Stabilization
+                print(f"\n  [Cycle {cycle_count}] Hash 'Found'. Verifying...")
+                yield  # Stabilization
+                
+                # Read final block data before verification
+                final_debug_block_data = yield dut._debug_block0_data.status
+                if final_debug_block_data != last_debug_block_data:
+                    block_bytes = final_debug_block_data.to_bytes(64, 'little')
+                    print(f"\n  [Final Block Data @ Cycle {cycle_count}] First 64 bytes:")
+                    print(f"    Bytes 0-15:   {' '.join(f'{b:02X}' for b in block_bytes[0:16])}")
+                    print(f"    Bytes 16-31:  {' '.join(f'{b:02X}' for b in block_bytes[16:32])}")
                 
                 # Run Verification Helper
-                yield from verify_hardware_state(dut, input_bytes)
+                verified = yield from verify_hardware_state(dut, test_input_bytes, target_clz)
                 
                 yield dut._control.storage.eq(0)
                 yield; yield
-                success = True
                 break
+            
+            # Check if still running or found
+            if not running and not found:
+                break
+            
+            # Progress indicator for long runs
+            if target_clz > 4 and cycle_count % 10000 == 0:
+                print(f"    Cycle {cycle_count}...", end='\r')
             
             yield
         
-        if not success:
-            print(f"  {Colors.WARNING}[WARNING] Test did not complete successfully{Colors.ENDC}")
+        if not verified and not timeout:
+            print("  [FAIL] Did not find solution")
         
-        return success
-
-    def generator():
-        # Test case 1: Single block (100 bytes)
-        test_bytes_1 = generate_byte_array(100)
-        yield from run_test_case("TEST 1 (Single Block)", test_bytes_1)
-        
-        # Wait between tests
-        for _ in range(20): yield
+        print("\n" + "="*70)
+        print("Test Complete!")
+        print("="*70)
 
     run_simulation(dut, generator(), vcd_name="sha3_txpow_csr_corrected.vcd")
 
 if __name__ == "__main__":
-    test_csr_mode()
+    # Parse command line arguments
+    input_size = 100  # Default
+    target_clz = 0     # Default (accept any hash)
+    
+    if len(sys.argv) >= 2:
+        try:
+            input_size = int(sys.argv[1])
+            if input_size < 1 or input_size > 2176:
+                print(f"ERROR: input_size must be between 1 and 2176 bytes")
+                sys.exit(1)
+        except ValueError:
+            print(f"ERROR: Invalid input_size format")
+            sys.exit(1)
+    
+    if len(sys.argv) >= 3:
+        try:
+            target_clz = int(sys.argv[2])
+            if target_clz < 0 or target_clz > 256:
+                print(f"ERROR: target_clz must be between 0 and 256")
+                sys.exit(1)
+        except ValueError:
+            print(f"ERROR: Invalid target_clz format")
+            sys.exit(1)
+    
+    print(f"SHA3 TxPoW Controller CSR Testbench")
+    print(f"Usage: python3 test_sha3_txpow_controller_csr.py [input_size] [target_clz]")
+    print(f"  input_size: 1-2176 bytes (default: 100)")
+    print(f"  target_clz: 0-256 leading zeros (default: 0)")
+    print()
+    
+    test_csr_mode(input_size, target_clz)

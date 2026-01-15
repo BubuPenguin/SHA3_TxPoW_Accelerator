@@ -10,12 +10,13 @@ This test compares software SHA3-256 (BouncyCastle) with hardware SHA3-256 (FPGA
 
 ## Test Data
 
-The test uses a 136-byte header with the following pattern:
+The test generates a header with the following pattern:
 - Bytes 0-1: Nonce structure (scale=1, length=32)
-- Bytes 2-33: Nonce field (zeros)
-- Bytes 34-135: Repeating pattern `[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]`
+- Bytes 2-33: Nonce field (zeros initially, overwritten at bytes 4-33 when nonce provided)
+- Bytes 34+: Repeating pattern `[0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88]`
 
-This matches the C hardware test in `FixedIterationStop/test_fixed_iteration.c`.
+Default input size is 100 bytes, matching the C hardware test default.
+Input size can be configured from 1 to 2176 bytes (16 blocks × 136 bytes).
 
 ## Build and Run
 
@@ -38,21 +39,31 @@ This will compile `Java_HW_test.java` and show you how to run the tests.
 
 ### Step 3: Run Tests
 
-**Basic test (no nonce):**
+**Basic test (default 100 bytes, no nonce):**
 ```bash
 ./verify_nonce.sh
 ```
 
-This runs the SHA3-256 hash on the default test header and displays the software hash result.
-
-**Verify hardware nonce:**
+**Test with custom input size:**
 ```bash
-./verify_nonce.sh <30-byte-nonce-in-hex>
+./verify_nonce.sh 200
 ```
 
-Example:
+**Verify hardware nonce with specific input size:**
 ```bash
-./verify_nonce.sh a1b2c3d4e5f607182933a4b5c6d7e8f90a1b2c3d4e5f607182933a4b5c6d7e
+./verify_nonce.sh <input_size> <30-byte-nonce-in-hex>
+```
+
+Examples:
+```bash
+# 100 bytes with nonce
+./verify_nonce.sh 100 a1b2c3d4e5f607182933a4b5c6d7e8f90a1b2c3d4e5f607182933a4b5c6d7e
+
+# 200 bytes with nonce (your example)
+./verify_nonce.sh 200 0000005EC244FCABD705DDEBC5F640477D87061E1968787A96E797161CB3C917
+
+# Multi-block test: 544 bytes (4 blocks)
+./verify_nonce.sh 544 a1b2c3d4e5f607182933a4b5c6d7e8f90a1b2c3d4e5f607182933a4b5c6d7e
 ```
 
 ### Optional: Native Library for Hardware Access

@@ -12,11 +12,12 @@ class KeccakDatapath(LiteXModule):
     
     OPTIMIZATION:
     - Implements "Just-In-Time" Padding.
+    - Implements "Early Increment" Pre-fetching to resolve multi-block timing violations.
     - Instead of pre-calculating a massive padded buffer for all blocks,
       it selects the raw block first, then applies padding logic only 
       to the active 1088-bit slice.
     """
-    def __init__(self, MAX_BLOCKS=16, MAX_DIFFICULTY_BITS=256, NONCE_DATA_FIELD_OVERWRITE_SPACING=2, NONCE_DATA_FIELD_OVERWRITE_SIZE=30, NONCE_FIELD_BYTE_SIZE=34, NONCE_DATA_FIELD_BYTE_SIZE=32, target_iterations=5000000): 
+    def __init__(self, MAX_BLOCKS=16, MAX_DIFFICULTY_BITS=256, NONCE_DATA_FIELD_OVERWRITE_SPACING=2, NONCE_DATA_FIELD_OVERWRITE_SIZE=30, NONCE_FIELD_BYTE_SIZE=34, NONCE_DATA_FIELD_BYTE_SIZE=32, target_attempts=5000000): 
         # --- Constants ---
         self.NONCE_DATA_FIELD_OVERWRITE_SPACING = NONCE_DATA_FIELD_OVERWRITE_SPACING 
         self.NONCE_DATA_FIELD_OVERWRITE_SIZE = NONCE_DATA_FIELD_OVERWRITE_SIZE
@@ -46,8 +47,12 @@ class KeccakDatapath(LiteXModule):
         self.timeout_limit = Signal(32, reset=0xFFFFFFFF)
         self.timeout = Signal()
         
+        # New Attempt Limit (Iterations). 0 = Disable.
+        self.attempt_limit = Signal(64)
+        self.no_attempts = Signal()
+        
         # --- Data Inputs ---
-        self.header_data = Signal(self.BLOCK_BITS * MAX_BLOCKS) 
+        self.header_data = Signal(self.BLOCK_BITS) 
         self.input_length = Signal(32)  
         self.target_clz = Signal(9, reset=0) # Required minimum CLZ (0 to 256) - number of leading zeros
         
@@ -55,15 +60,27 @@ class KeccakDatapath(LiteXModule):
         # Nonce result is 32 bytes (256 bits) = 30-byte nonce + 2-byte header prefix
         self.nonce_result = Signal(self.NONCE_DATA_FIELD_BYTE_SIZE * 8)
         
-        # Debug: Expose the first 64 bytes of block 0 with nonce injected (for verification)
+        # Debug: Expose the first 64 bytes of the current block being processed
+        # For Block 0: Shows data with nonce injected (nonce_mask applied)
+        # For subsequent blocks: Shows raw block data (nonce_mask is 0)
+        # Updated every ABSORB cycle to capture all blocks for verification
         self.debug_block0_data = Signal(512)  # 64 bytes = 512 bits
         
         # --- Internals ---
         self.round_index = Signal(5)
         self.timeout_counter = Signal(32)
-        self.iteration_counter = Signal(64)  # 64-bit counter for hash iterations
+        self.attempts_counter = Signal(64)  # 64-bit counter for hash attempts
+        self.no_cores = 2 # SIMD-2
         
-        self.block_counter = Signal(max=MAX_BLOCKS)
+        # Completion Status (0=None, 1=Found 0, 2=Found 1, 3=Timeout)
+        self.completion_status = Signal(2)
+        
+        # --- FIX: Split Block Logic ---
+        # block_addr: Controls the MUX. Increments EARLY (Cycle 0 of Permute)
+        # loop_counter: Controls the FSM. Increments LATE (Cycle 23 of Permute)
+        self.block_addr = Signal(max=MAX_BLOCKS)
+        self.loop_counter = Signal(max=MAX_BLOCKS)
+        
         self.total_blocks = Signal(max=MAX_BLOCKS)
         
         self.state_0 = Signal(1600)
@@ -99,18 +116,19 @@ class KeccakDatapath(LiteXModule):
         self.comb += block_calc_stmt
 
         # =========================================================================
-        # 2. RAW BLOCK SELECTOR (Stage 1)
+        # 2. PIPELINED BLOCK INPUT (BRAM Interface)
         # =========================================================================
         
-        # First, simply select the raw data relevant to the current block counter.
-        # This creates one MUX for the raw data, rather than calculating padding for ALL data.
+        # The Controller now handles the BRAM addressing using 'self.block_addr'.
+        # 'self.header_data' receives the output of the BRAMs (1088 bits).
+        # We simply register this input to cut timing paths between BRAM clock-to-out
+        # and the datapath logic.
         
         current_raw_block = Signal(self.BLOCK_BITS)
-        block_cases = {}
-        for b in range(MAX_BLOCKS):
-            block_cases[b] = current_raw_block.eq(self.header_data[b*self.BLOCK_BITS : (b+1)*self.BLOCK_BITS])
         
-        self.comb += Case(self.block_counter, block_cases)
+        # REGISTER the input (Pipeline Stage)
+        # This gives us a clean cycle for the data to arrive from the BRAM macros.
+        self.sync += current_raw_block.eq(self.header_data)
         # =========================================================================
         # 3. LUT PADDING LOGIC (Stage 2)
         # =========================================================================
@@ -168,8 +186,8 @@ class KeccakDatapath(LiteXModule):
             
             # Calculate the Global Index of this word
             # (Current Block * 17) + i
-            # FIX: Use multiplication instead of shift to avoid Migen arithmetic shift bug
-            global_word_idx = (self.block_counter * 17) + i
+            # FIX: Calculate global index based on block_addr
+            global_word_idx = (self.block_addr * 17) + i
             
             raw_word = current_raw_block[i*64 : (i+1)*64]
             word_out = Signal(64)
@@ -228,19 +246,18 @@ class KeccakDatapath(LiteXModule):
             masked_nonce_1.eq(self.nonce_1 & width_mask)
         ]
 
+        # FIX: Check block_addr here. In ABSORB, block_addr is correct (0).
         self.comb += [
-            If(self.block_counter == 0,
-                # Use Cat() to build the mask: [padding_low, nonce, padding_high]
-                # nonce_mask = {padding_high, nonce, padding_low}
+            If(self.block_addr == 0,
                 nonce_mask_0.eq(Cat(
-                    Constant(0, self.NONCE_START_BIT),           # Bits 0-31: zeros
-                    masked_nonce_0,                               # Bits 32-271: nonce (240 bits)
-                    Constant(0, 1600 - self.NONCE_START_BIT - self.NONCE_WIDTH_BITS)  # Bits 272-1599: zeros
+                    Constant(0, self.NONCE_START_BIT),
+                    masked_nonce_0,
+                    Constant(0, 1600 - self.NONCE_START_BIT - self.NONCE_WIDTH_BITS)
                 )),
                 nonce_mask_1.eq(Cat(
-                    Constant(0, self.NONCE_START_BIT),           # Bits 0-31: zeros
-                    masked_nonce_1,                               # Bits 32-271: nonce (240 bits)
-                    Constant(0, 1600 - self.NONCE_START_BIT - self.NONCE_WIDTH_BITS)  # Bits 272-1599: zeros
+                    Constant(0, self.NONCE_START_BIT),
+                    masked_nonce_1,
+                    Constant(0, 1600 - self.NONCE_START_BIT - self.NONCE_WIDTH_BITS)
                 ))
             ).Else(
                 nonce_mask_0.eq(0),
@@ -312,13 +329,25 @@ class KeccakDatapath(LiteXModule):
             self.running.eq(0),
             self.found.eq(0),
             self.idle.eq(1),
+            
+            # Optimization: Reset block_addr to 0 in IDLE.
+            # This ensures that while we wait for Start, the BRAMs are reading Block 0,
+            # and the pipeline register 'current_raw_block' catches it.
+            # By the time we start, Block 0 is already valid!
+            NextValue(self.block_addr, 0),
+            
             # Only start if the Start signal is asserted
             If(self.start,
+                # Clear status signals when starting new hash
+                NextValue(self.found, 0),
+                NextValue(self.timeout, 0), 
+                NextValue(self.completion_status, 0), # Reset status
+                NextValue(self.timeout_counter, 0),
+                NextValue(self.attempts_counter, 0),  # Reset attempts counter
+                self.timeout.eq(0),
+                self.no_attempts.eq(0),
                 NextValue(self.nonce_0, 1),
                 NextValue(self.nonce_1, 0),
-                NextValue(self.timeout_counter, 0),
-                NextValue(self.iteration_counter, 0),  # Reset iteration counter
-                self.timeout.eq(0),
                 NextState("INIT_HASH")
             )
         )
@@ -328,21 +357,22 @@ class KeccakDatapath(LiteXModule):
             self.idle.eq(0),
             NextValue(self.state_0, 0),
             NextValue(self.state_1, 0),
-            NextValue(self.block_counter, 0),
-            NextState("ABSORB")
+            # block_addr is already 0 from IDLE or CHECK_RESULT
+            NextValue(self.loop_counter, 0),
+            # Direct transition to ABSORB because pipeline is primed
+            NextState("ABSORB") 
         )
         
         self.fsm.act("ABSORB",
             self.running.eq(1),
             self.idle.eq(0),
-            # XOR Data into State
             NextValue(self.state_0, self.state_0 ^ padded_slice_extended ^ nonce_mask_0),
             NextValue(self.state_1, self.state_1 ^ padded_slice_extended ^ nonce_mask_1),
             NextValue(self.round_index, 0),
-            # Debug: Capture first 64 bytes of block 0 data with nonce for verification
-            If(self.block_counter == 0,
-                NextValue(self.debug_block0_data, (padded_slice_extended ^ nonce_mask_0)[0:512])
-            ),
+            # Debug: Capture first 512 bits of current block for every iteration
+            # Block 0: padded_slice_extended ^ nonce_mask_0 (shows nonce injection)
+            # Block 1+: padded_slice_extended (nonce_mask_0 is 0, shows raw data)
+            NextValue(self.debug_block0_data, (padded_slice_extended ^ nonce_mask_0)[0:512]),
             NextState("PERMUTE")
         )
         
@@ -352,10 +382,19 @@ class KeccakDatapath(LiteXModule):
             NextValue(self.state_0, Cat(*self.core_0.iota_out)),
             NextValue(self.state_1, Cat(*self.core_1.iota_out)),
             
+            # --- FIX: EARLY INCREMENT LOGIC ---
+            # At Round 0, check if we will need another block later.
+            # If so, increment the address NOW. This gives the MUX 23 cycles 
+            # to switch and settle before we reach ABSORB again.
+            If((self.round_index == 0) & (self.block_addr < self.total_blocks - 1),
+                NextValue(self.block_addr, self.block_addr + 1)
+            ),
+            
             If(self.round_index == 23,
-                If((self.block_counter + 1) < self.total_blocks,
-                    NextValue(self.block_counter, self.block_counter + 1),
-                    NextState("ABSORB")
+                # At Round 23, we use loop_counter to control the flow.
+                If((self.loop_counter + 1) < self.total_blocks,
+                    NextValue(self.loop_counter, self.loop_counter + 1),
+                    NextState("ABSORB") 
                 ).Else(
                     NextState("CHECK_RESULT")
                 )
@@ -374,46 +413,53 @@ class KeccakDatapath(LiteXModule):
             
             # Check timeout FIRST (before checking results) to ensure cycle limit is enforced
             If((self.timeout_limit != 0) & (self.timeout_counter >= self.timeout_limit),
-                self.timeout.eq(1),
-                NextState("DONE_TIMEOUT")
+                NextValue(self.completion_status, 3), # Timeout
+                NextState("DONE")
+            # Check attempt limit (NoAttempt)
+            ).Elif((self.attempt_limit != 0) & (self.attempts_counter >= self.attempt_limit),
+                NextValue(self.completion_status, 4), # NoAttempt (Exhausted)
+                NextState("DONE")
             ).Elif(self.clz_0_out >= self.target_clz,
                 NextValue(self.nonce_result, Cat(self.header_data[16:32], self.nonce_0)),
-                NextState("DONE_FOUND_0") 
+                NextValue(self.completion_status, 1), # Found 0
+                NextState("DONE") 
             ).Elif(self.clz_1_out >= self.target_clz,
                 NextValue(self.nonce_result, Cat(self.header_data[16:32], self.nonce_1)),
-                NextState("DONE_FOUND_1")
+                NextValue(self.completion_status, 2), # Found 1
+                NextState("DONE")
             ).Elif(self.stop,
                 NextState("IDLE")
             ).Else(
                 NextValue(self.nonce_0, self.nonce_0 + 1),
-                NextValue(self.nonce_1, self.state_1[0:self.NONCE_WIDTH_BITS]),
-                NextValue(self.iteration_counter, self.iteration_counter + 1),  # Increment iteration counter
+                NextValue(self.nonce_1, self.state_0[0:self.NONCE_WIDTH_BITS]), # Stochastic update
+                NextValue(self.attempts_counter, self.attempts_counter + self.no_cores),
+                
+                # When restarting loop, we must reset block_addr to 0.
+                NextValue(self.block_addr, 0),
+                
                 NextState("INIT_HASH")
             )
         )
         
-        # --- NEW HANDSHAKE STATES ---
+        # --- NEW HANDSHAKE STATE ---
+        # Consolidated state for all completion types (Found 0, Found 1, Timeout, NoAttempt)
+        # Holds the result signals until software clears 'start'
         
-        # Hold FOUND=1 until software clears 'start'
-        self.fsm.act("DONE_FOUND_0",
+        self.fsm.act("DONE",
             self.running.eq(0),
-            self.found.eq(1),
             self.idle.eq(0),
-            If(~self.start, NextState("IDLE"))
-        )
-        
-        # Hold FOUND=2 until software clears 'start'
-        self.fsm.act("DONE_FOUND_1",
-            self.running.eq(0),
-            self.found.eq(2),
-            self.idle.eq(0),
-            If(~self.start, NextState("IDLE"))
-        )
-        
-        # Hold TIMEOUT until software clears 'start'
-        self.fsm.act("DONE_TIMEOUT",
-            self.running.eq(0),
-            self.timeout.eq(1),
-            self.idle.eq(0),
+            
+            # Drive outputs based on the stored completion status
+            If(self.completion_status == 1,      # Found 0
+                self.found.eq(1)
+            ).Elif(self.completion_status == 2,  # Found 1
+                self.found.eq(2)
+            ).Elif(self.completion_status == 3,  # Timeout
+                self.timeout.eq(1)
+            ).Elif(self.completion_status == 4,  # NoAttempt
+                self.no_attempts.eq(1)
+            ),
+            
+            # Wait for handshake
             If(~self.start, NextState("IDLE"))
         )

@@ -48,14 +48,14 @@ class SHA3TxPoWController(LiteXModule):
     FIX: Uses atomic write capture to prevent timing issues where
     the write address increments before the data is consumed.
     """
-    def __init__(self, target_iterations=5000000):
+    def __init__(self, target_attempts=5000000):
         # --- CSR Definitions ---
         self._control = CSRStorage(2, description="Control Register [0:Start, 1:Stop]")
-        self._status  = CSRStatus(4, description="Status Register [0:Idle, 1:Running, 2:Found, 3:Timeout]")
+        self._status  = CSRStatus(5, description="Status Register [0:Idle, 1:Running, 2:Found, 3:Timeout, 4:NoAttempt]")
         
         self._nonce_result = CSRStatus(MNONCE_DATA_FIELD_BYTE_SIZE * 8, description="Result Nonce")
         self._hash_result  = CSRStatus(256, description="Hash Output (SHA3-256, 32 bytes)")
-        self._iteration_count = CSRStatus(64, description="Number of hash iterations performed")
+        self._attempts_count = CSRStatus(64, description="Number of hash attempts performed") # UPDATED DESCRIPTION
         self._target_clz = CSRStorage(9, description="Target Difficulty (CLZ: number of leading zeros, 0-256)")
         
         # Debug CSRs (Solution 2 from EXECUTIVE_SUMMARY)
@@ -65,11 +65,14 @@ class SHA3TxPoWController(LiteXModule):
         self._debug_clz1 = CSRStatus(9, description="Debug: CLZ of Hash 1 (actual leading zeros)")
         self._debug_comparison = CSRStatus(2, description="Debug: comparison results [0:hash0_lt, 1:hash1_lt]")
         
-        # Debug: Expose first 64 bytes of block 0 after nonce injection (for verification)
-        # This shows the nonce area and some context (bytes 0-63)
-        self._debug_block0_data = CSRStatus(512, description="Debug: Block 0 first 64 bytes (bits [511:0])")
+        # Debug: Expose first 64 bytes of current block being processed (for verification)
+        # For Block 0: Shows data with nonce injected (nonce area + context)
+        # For subsequent blocks: Shows raw block data to verify correct input
+        # Updated every ABSORB cycle to capture all blocks
+        self._debug_block0_data = CSRStatus(512, description="Debug: Current block first 64 bytes (bits [511:0])")
         
         self._timeout = CSRStorage(64, description="Timeout Limit (Clock Cycles). 0=Disable")
+        self._attempt_limit = CSRStorage(64, description="Attempt Limit (Iterations). 0=Disable")
         
         # Input Length for Padding
         self._input_len = CSRStorage(32, description="Length of input header in bytes")
@@ -98,7 +101,7 @@ class SHA3TxPoWController(LiteXModule):
         self.ev.finalize()
         
         # --- Instantiate DMA Reader ---
-        self.submodules.dma = WishboneDMAReader(self.bus, endianness="little", fifo_depth=16, with_csr=True)
+        self.submodules.dma = WishboneDMAReader(self.bus, fifo_depth=16, with_csr=True)
         
         # --- Instantiate Miner ---
         self.submodules.miner = KeccakDatapath(
@@ -108,31 +111,27 @@ class SHA3TxPoWController(LiteXModule):
             NONCE_DATA_FIELD_OVERWRITE_SIZE=MNONCE_DATA_FIELD_OVERWRITE_SIZE,
             NONCE_FIELD_BYTE_SIZE=MNONCE_FIELD_BYTE_SIZE,
             NONCE_DATA_FIELD_BYTE_SIZE=MNONCE_DATA_FIELD_BYTE_SIZE,
-            target_iterations=target_iterations
+            target_attempts=target_attempts #for testbenches
         )
         
-        # --- Header Storage ---
-        # Single unified 2176-byte memory (272 x 64-bit words)
-        header_memory = Memory(width=WORD_WIDTH, depth=HEADER_WORDS, init=None)
-        self.specials += header_memory
+        # --- Header Storage (Banked BRAM) ---
+        # Replaces simple Array of Signals with 17 parallel BRAM banks.
+        # Structure: 17 Banks, each 16 words deep (64-bit width)
+        # Total Capacity: 17 * 16 * 8 bytes = 2176 bits (covers 2KB header)
         
-        # Write port (supports both DMA and CSR writes)
-        header_write_port = header_memory.get_port(write_capable=True, we_granularity=0)
-        self.specials += header_write_port
+        # Define 17 separate memories
+        self.specials.mem_banks = mem_banks = [Memory(width=64, depth=16, name=f"header_bank_{i}") for i in range(17)]
         
-        # Read ports for all words (needed to concatenate entire memory)
-        # Create read signals for each word
-        header_read_data = Array(Signal(WORD_WIDTH) for _ in range(HEADER_WORDS))
+        # Create Read and Write ports for each bank
+        # We need to access all 17 banks simultaneously for reading (1088-bit read)
+        # We only write to one bank at a time (64-bit write)
         
-        # Create read ports for each word (combinational reads)
-        for i in range(HEADER_WORDS):
-            read_port = header_memory.get_port()
-            self.specials += read_port
-            # Set address to word index
-            self.comb += read_port.adr.eq(i)
-            # Capture read data
-            self.comb += header_read_data[i].eq(read_port.dat_r)
+        bank_write_ports = [mem.get_port(write_capable=True, mode="WRITE_FIRST") for mem in mem_banks]
+        bank_read_ports  = [mem.get_port(write_capable=False, async_read=False) for mem in mem_banks] # synchronous read
         
+        self.specials += bank_write_ports
+        self.specials += bank_read_ports
+
         # --- Header Storage Write Logic (CSR and DMA) ---
         
         # =========================================================================
@@ -161,7 +160,7 @@ class SHA3TxPoWController(LiteXModule):
             )
         ]
         
-        # Unified write port logic
+        # Unified write logic - Determine write address and data based on priority
         # Priority 1: DMA write (immediate, no pipeline delay)
         # Priority 2: CSR write (Manual) - Use combined_header (Low bits first)
         write_addr = Signal(addr_width)
@@ -180,22 +179,59 @@ class SHA3TxPoWController(LiteXModule):
                 write_enable.eq(1)
             ).Else(
                 write_enable.eq(0)
-            ),
-            # Connect to memory write port
-            header_write_port.adr.eq(write_addr),
-            header_write_port.dat_w.eq(write_data),
-            header_write_port.we.eq(write_enable)
+            )
         ]
+        
+        # Bank Selection Logic for Writes
+        # Map linear address (0..271) to (Bank 0..16, Offset 0..15).
+        # Implementation: Combinatorial decoding because direct modulo/div signals are not synthesizable.
+        
+        for k in range(17):
+            # 1. Bank Selection (Addr % 17 == k)
+            # Generate write enable if address matches any global address belonging to this bank.
+            # Addresses for Bank K are: K, K+17, K+34...
+            addresses_for_bank_k = [k + (17 * n) for n in range(16)]
+            
+            is_address_for_bank = 0
+            for addr_val in addresses_for_bank_k:
+                is_address_for_bank = is_address_for_bank | (write_addr == addr_val)
+            
+            bank_is_selected = is_address_for_bank
+            
+            # 2. Offset Selection (Addr // 17)
+            # Map global linear address to local bank offset (0-15).
+            # We use a Case statement to decode the specific row index.
+            bank_addr_cases = {}
+            for row_idx in range(16):
+                global_addr = k + (17 * row_idx)
+                bank_addr_cases[global_addr] = bank_write_ports[k].adr.eq(row_idx)
+                
+            self.comb += Case(write_addr, bank_addr_cases)
+
+            self.comb += [
+                # bank_write_ports[k].adr is set by Case above
+                bank_write_ports[k].dat_w.eq(write_data),
+                bank_write_ports[k].we.eq(write_enable & bank_is_selected)
+            ]
+            
+            # Connect Read Ports
+            # All banks read from the address requested by the miner (block_addr)
+            # The miner controls the address (0 to 15)
+            self.comb += bank_read_ports[k].adr.eq(self.miner.block_addr)
         
         # =========================================================================
         
-        # Connect flattened storage to miner input
-        self.comb += self.miner.header_data.eq(Cat(*header_read_data))
+        # Connect Memory Outputs to Miner Input
+        # We concatenate the output of all 17 banks to form the full block.
+        # Order implies Bank 0 is LSB (Words 0, 17, 34...)
+        
+        self.comb += self.miner.header_data.eq(Cat(*[bank_read_ports[k].dat_r for k in range(17)]))
         
         # --- Control & Status ---
         self.comb += [
             self.miner.target_clz.eq(self._target_clz.storage),
             self.miner.timeout_limit.eq(self._timeout.storage),
+            self.miner.attempt_limit.eq(self._attempt_limit.storage),
             self.miner.input_length.eq(self._input_len.storage), 
             
             self.miner.start.eq(self._control.storage[0]),
@@ -204,14 +240,15 @@ class SHA3TxPoWController(LiteXModule):
             # Status Mapping
             self._status.status[0].eq(self.miner.idle),
             self._status.status[1].eq(self.miner.running),
-            self._status.status[2].eq(self.miner.found != 0),
-            self._status.status[3].eq(self.miner.timeout),
+            self._status.status[2].eq((self.miner.completion_status == 1) | (self.miner.completion_status == 2)),
+            self._status.status[3].eq(self.miner.completion_status == 3),
+            self._status.status[4].eq(self.miner.completion_status == 4),
             
             # Connect the miner result to the CSR status
             # Nonce result is 32 bytes (256 bits) - read directly from miner.nonce_result
             # The datapath handles concatenation with header_data bytes [2:3]
             self._nonce_result.status.eq(self.miner.nonce_result[0:256]),
-            self._iteration_count.status.eq(self.miner.iteration_counter),
+            self._attempts_count.status.eq(self.miner.attempts_counter),
             
             # Debug CSRs (Solution 2 from EXECUTIVE_SUMMARY)
             # Expose internal comparison values for debugging
@@ -223,8 +260,10 @@ class SHA3TxPoWController(LiteXModule):
             self._debug_comparison.status[0].eq(self.miner.hash0_lt_target),
             self._debug_comparison.status[1].eq(self.miner.hash1_lt_target),
             
-            # Debug: Expose first 64 bytes of block 0 data (512 bits)
-            # This captures the nonce area with context
+            # Debug: Expose first 64 bytes of current block data (512 bits)
+            # Block 0: Shows nonce injection (nonce area + context)
+            # Block 1+: Shows raw block data to verify correct input
+            # Updated every ABSORB cycle for all blocks
             self._debug_block0_data.status.eq(self.miner.debug_block0_data[0:512]),
         ]
         
@@ -235,9 +274,9 @@ class SHA3TxPoWController(LiteXModule):
         self.last_hash = Signal(256)
         
         self.sync += [
-            If(self.miner.found == 1,
+            If(self.miner.completion_status == 1,
                 self.last_hash.eq(self.miner.state_0[0:256])
-            ).Elif(self.miner.found == 2,
+            ).Elif(self.miner.completion_status == 2,
                 self.last_hash.eq(self.miner.state_1[0:256])
             )
             # No Else: Retain value until next solution is found
@@ -248,6 +287,6 @@ class SHA3TxPoWController(LiteXModule):
         
         # Trigger interrupts
         self.comb += [
-            self.ev.found.trigger.eq(self.miner.found != 0),
-            self.ev.timeout.trigger.eq(self.miner.timeout)
+            self.ev.found.trigger.eq((self.miner.completion_status == 1) | (self.miner.completion_status == 2)),
+            self.ev.timeout.trigger.eq((self.miner.completion_status == 3) | (self.miner.completion_status == 4))
         ]
